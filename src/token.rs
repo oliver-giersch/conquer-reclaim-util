@@ -188,11 +188,14 @@ impl<T: AtomicToken, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
     pub fn get_token(&self, token: T::Token, order: Ordering) -> &T {
         assert_order(order);
         let mut prev = &self.head;
-        // (lst:1) this acq load syncs-with the acq-rel CAS (lst:3)
-        let mut curr = prev.load(Ordering::Acquire);
-
         // iterate over the nodes in the linked list from the head
-        while !curr.is_null() {
+        loop {
+            // (lst:1) this acq load syncs-with the rel-acq CAS (lst:2)
+            let curr = prev.load(Ordering::Acquire);
+            if curr.is_null() {
+                break;
+            }
+
             // try to acquire a token in the current node
             if let Some(atomic) = unsafe { self.try_insert_in(curr as *const _, token, order) } {
                 return atomic;
@@ -200,8 +203,6 @@ impl<T: AtomicToken, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
 
             // ...if no token was currently available, advance to the next node
             prev = unsafe { &(*curr).next };
-            // (lst:2) this acq load syncs-with the acq-rel CAS (lst:3)
-            curr = prev.load(Ordering::Acquire);
         }
 
         // if no token could be acquired from any already allocated node, a new node must be
@@ -220,9 +221,9 @@ impl<T: AtomicToken, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
         // allocate a new node with `token` stored in the first slot.
         let node = Box::into_raw(Box::new(Node::new(token)));
         // attempt to append the new node after the current tail node
-        // (lst:3) this acq-rel/acq CAS syncs with the acq loads (lst:1), (lst:2)
-        // note: the precise ordering would be rel-acq, since on success nothing needs to be
-        // acquired
+        // (lst:2) this rel/acq CAS syncs with the acq load (lst:1)
+        // note: the most precise ordering would be rel-acq, since on success it must only be
+        // guaranteed that the previous node allocation happens-before the CAS
         while let Err(read) = (*tail).compare_exchange(ptr::null_mut(), node, AcqRel, Acquire) {
             // the previous CAS failed, so another thread must have succeeded in appending a
             // different node, so this thread attempts to insert its token into that node, first
@@ -313,6 +314,7 @@ impl<'a, T: AtomicToken, const NODE_SIZE: usize> Iterator for Iter<'a, T, NODE_S
                 return Some(&node.tokens[idx]);
             } else {
                 // try to advance to next node
+                // (lst:4) this acq load syncs-with the rel-acq CAS (lst:3)
                 self.curr = unsafe { node.next.load(Ordering::Acquire).as_ref() };
                 self.idx = 0;
             }
