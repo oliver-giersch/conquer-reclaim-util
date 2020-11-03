@@ -1,4 +1,7 @@
-//! TODO: mod-lvl docs
+//! This module provides an implementation for a concurrent lock-free queue of
+//! atomic tokens.
+//! The queue never frees any memory during its lifetime and hence does not
+//! require a dedicated memory reclamation mechanism.
 
 use core::{
     iter::FusedIterator,
@@ -14,6 +17,13 @@ use alloc::boxed::Box;
 // *************************************************************************************************
 
 /// A token that can be stored inside a [`TokenQueue`][TokenQueue].
+///
+/// All functions (except [`new`][AtomicToken::new]) must be implemented using
+/// appropriate atomic (lock-free) synchronization primitives, meaning this
+/// trait can in general only be implemented for types with a size of at most
+/// the size of `usize`.
+/// On platform providing atomic instructions like `cmpxchg16b`, implementations
+/// for types whose size matches `(usize, usize)` are also possible.
 ///
 /// # Safety
 ///
@@ -132,6 +142,10 @@ pub struct TokenQueue<T, const NODE_SIZE: usize> {
 /********** impl inherent (const) *****************************************************************/
 
 impl<T, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
+    #[allow(dead_code)]
+    #[forbid(const_err)]
+    const ASSERT_NON_ZERO: usize = NODE_SIZE - 1;
+
     /// Creates an empty queue.
     #[inline]
     pub const fn new() -> Self {
@@ -144,6 +158,30 @@ impl<T, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
 /********** impl inherent *************************************************************************/
 
 impl<T: AtomicToken, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
+    /// Creates an empty queue with at least `cap` elements already
+    /// pre-allocated.
+    ///
+    /// As long as no more than `cap` elements are ever used, the queue will
+    /// never have to allocate any additional memory after creation.
+    /// Hence, the queue will be completely lock-free, regardless of the memory
+    /// allocator in use.
+    #[inline(never)]
+    pub fn with_capacity(cap: usize) -> Self {
+        let queue = Self::new();
+        if cap == 0 {
+            return queue;
+        }
+
+        let mut curr = &queue.head;
+        for _ in 0..(cap / NODE_SIZE) {
+            let node = Box::leak(Box::new(Node::with(T::NOT_YET_USED)));
+            curr.store(node, Ordering::Relaxed);
+            curr = &node.next;
+        }
+
+        queue
+    }
+
     /// Returns an unique token reference set to [`RESERVED`][AtomicToken::RESERVED].
     ///
     /// The queue first attempts to acquire a token that already exists but is
@@ -189,20 +227,15 @@ impl<T: AtomicToken, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
         assert_order(order);
         let mut prev = &self.head;
         // iterate over the nodes in the linked list from the head
-        loop {
-            // (lst:1) this acq load syncs-with the rel-acq CAS (lst:2)
-            let curr = prev.load(Ordering::Acquire);
-            if curr.is_null() {
-                break;
-            }
-
+        // (lst:1) this acq load syncs-with the rel-acq CAS (lst:2)
+        while let Some(curr) = unsafe { prev.load(Ordering::Acquire).as_ref() } {
             // try to acquire a token in the current node
-            if let Some(atomic) = unsafe { self.try_insert_in(curr as *const _, token, order) } {
+            if let Some(atomic) = unsafe { self.try_insert_in(curr, token, order) } {
                 return atomic;
             }
 
             // ...if no token was currently available, advance to the next node
-            prev = unsafe { &(*curr).next };
+            prev = &curr.next;
         }
 
         // if no token could be acquired from any already allocated node, a new node must be
@@ -219,9 +252,9 @@ impl<T: AtomicToken, const NODE_SIZE: usize> TokenQueue<T, NODE_SIZE> {
     ) -> &T {
         use Ordering::{AcqRel, Acquire};
         // allocate a new node with `token` stored in the first slot.
-        let node = Box::into_raw(Box::new(Node::new(token)));
+        let node = Box::into_raw(Box::new(Node::with(token)));
         // attempt to append the new node after the current tail node
-        // (lst:2) this rel/acq CAS syncs with the acq load (lst:1)
+        // (lst:2) this rel/acq CAS syncs with the acq load (lst:1), (lst:3)
         // note: the most precise ordering would be rel-acq, since on success it must only be
         // guaranteed that the previous node allocation happens-before the CAS
         while let Err(read) = (*tail).compare_exchange(ptr::null_mut(), node, AcqRel, Acquire) {
@@ -294,7 +327,9 @@ impl<T, const NODE_SIZE: usize> Drop for TokenQueue<T, NODE_SIZE> {
 /// An iterator over all tokens in a [`TokenQueue`].
 #[derive(Debug)]
 pub struct Iter<'a, T, const NODE_SIZE: usize> {
+    /// The current array index in current node.
     idx: usize,
+    /// The current node.
     curr: Option<&'a Node<T, NODE_SIZE>>,
 }
 
@@ -305,7 +340,7 @@ impl<'a, T: AtomicToken, const NODE_SIZE: usize> Iterator for Iter<'a, T, NODE_S
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        // this loop is executed at most twice
+        // this loop is executed at most twice per invocation
         while let Some(node) = self.curr {
             if self.idx < NODE_SIZE {
                 // current iteration is at some token in the current node
@@ -314,7 +349,7 @@ impl<'a, T: AtomicToken, const NODE_SIZE: usize> Iterator for Iter<'a, T, NODE_S
                 return Some(&node.tokens[idx]);
             } else {
                 // try to advance to next node
-                // (lst:4) this acq load syncs-with the rel-acq CAS (lst:3)
+                // (lst:3) this acq load syncs-with the rel-acq CAS (lst:2)
                 self.curr = unsafe { node.next.load(Ordering::Acquire).as_ref() };
                 self.idx = 0;
             }
@@ -332,6 +367,7 @@ impl<'a, T: AtomicToken, const NODE_SIZE: usize> FusedIterator for Iter<'a, T, N
 // Node
 // *************************************************************************************************
 
+/// A node in the linked list.
 #[repr(C)]
 #[derive(Debug)]
 struct Node<T, const NODE_SIZE: usize> {
@@ -345,7 +381,7 @@ struct Node<T, const NODE_SIZE: usize> {
 
 impl<T: AtomicToken, const NODE_SIZE: usize> Node<T, NODE_SIZE> {
     #[inline]
-    fn new(first: T::Token) -> Self {
+    fn with(first: T::Token) -> Self {
         // initialize array of atomic tokens
         let tokens = unsafe {
             // create uninitialized array
@@ -376,4 +412,58 @@ fn assert_order(order: Ordering) {
         order == Ordering::Release || order == Ordering::AcqRel || order == Ordering::SeqCst,
         "the `order` must be `Release` or stronger"
     )
+}
+
+#[cfg(test)]
+mod test {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+
+    use super::AtomicToken;
+
+    const NODE_SIZE: usize = 128;
+    type TokenQueue = super::TokenQueue<HazardPtr, 0>;
+
+    struct HazardPtr(AtomicPtr<()>);
+    unsafe impl AtomicToken for HazardPtr {
+        type Token = *const ();
+
+        const NOT_YET_USED: Self::Token = 0x0 as *const ();
+        const FREE: Self::Token = 0x1 as *const ();
+        const RESERVED: Self::Token = 0x2 as *const ();
+
+        fn new(token: Self::Token) -> Self {
+            Self(AtomicPtr::new(token as *mut ()))
+        }
+
+        fn load(&self, order: Ordering) -> Self::Token {
+            self.0.load(order) as *const ()
+        }
+
+        fn store(&self, token: Self::Token, order: Ordering) {
+            self.0.store(token as *mut (), order);
+        }
+
+        fn compare_exchange(
+            &self,
+            current: Self::Token,
+            new: Self::Token,
+            success: Ordering,
+            failure: Ordering,
+        ) -> Result<Self::Token, Self::Token> {
+            self.0
+                .compare_exchange(current as *mut (), new as *mut (), success, failure)
+                .map(|ptr| ptr as *const ())
+                .map_err(|ptr| ptr as *const ())
+        }
+    }
+
+    #[test]
+    fn with_capacity() {
+        let queue = TokenQueue::with_capacity(NODE_SIZE / 2);
+        let head = unsafe { queue.head.load(Ordering::Relaxed).as_ref().unwrap() };
+        assert!(head.next.load(Ordering::Relaxed).is_null());
+        for token in &head.tokens {
+            assert_eq!(token.load(Ordering::Relaxed), HazardPtr::NOT_YET_USED);
+        }
+    }
 }
